@@ -33,6 +33,8 @@ module Data.Aeson.Zippy
   , foldr
   , parseValue
   , isEmpty
+  , root
+  , jsonPath
   ) where
 
 import Prelude hiding (foldr, read, fail)
@@ -328,3 +330,22 @@ parseValue decoder = runDecoder decoder . mkCursor
 isNull :: JCurs -> Bool
 isNull curs = focusType curs == JNull
 
+-- | Get root 'AT.Value' from 'JCurs'
+root :: JCurs -> AT.Value
+root = \case
+  Top f -> f
+  Array p _ _ -> root p
+  Object p _ _ -> root p
+
+-- | Render JSON path of 'JCurs'
+jsonPath :: JCurs -> T.Text
+jsonPath = T.intercalate "." . reverse . fmap render . parts
+  where
+    render = \case
+      Top _ -> "$"
+      Array _ ix _ -> "[" <> (T.pack . show $ ix) <> "]"
+      Object _ field _ -> field
+    parts = \case
+      t@(Top _) -> [t]
+      t@(Array p _ _) -> t : parts p
+      t@(Object p _ _) -> t : parts p
