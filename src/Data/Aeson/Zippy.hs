@@ -8,9 +8,6 @@ module Data.Aeson.Zippy
   , ConversionFailure(..)
   , BoundError(..)
   , JTy(..)
-  , Wrapped(..)
-  , Message(..)
-  , throwCustomError
   , isNull
   , attoparsec
   , int
@@ -35,20 +32,21 @@ module Data.Aeson.Zippy
   , isEmpty
   , root
   , jsonPath
+  , failWith
+  , failMessage
   ) where
 
 import Prelude hiding (foldr, read, fail)
 
-import Data.Typeable
-import Data.Functor.Alt
 import Data.Functor (($>))
+import Control.Applicative
+import Control.Monad
 import qualified Data.Aeson.Types as AT
 import qualified Data.Attoparsec.Text as APS
 import qualified Data.HashMap.Strict as HM
 import qualified Data.Vector as V
 import qualified Data.Text as T
 import qualified Data.List.NonEmpty as NE
-import Control.Monad.Except
 import qualified Data.Scientific as S
 
 data JCurs = Top AT.Value
@@ -73,20 +71,16 @@ data ConversionFailure = AesonError T.Text
                        | FieldMissing T.Text     -- | Name of missing field
                        | OutOfBounds BoundError  -- | Attempt to move outside bounds of array or object ('up' when at the top of json document or accessing outside bounds of array
                        | EmptyContainer          -- | Result of attempting to 'down' into an empty array or object
-                       | Other Wrapped           -- | Custom user error produced with 'throwCustomError'
+                       | NoDecoderMatched
+                       | Other T.Text
                        deriving Show
-data Wrapped = forall r. (Typeable r, Show r) => Wrapped r
-
-instance Show Wrapped where
-  show (Wrapped inner) = show inner
-
-data Message = Message T.Text deriving (Typeable, Show)
 
 instance Functor Decoder where
   fmap f (Decoder df) = Decoder $ \curs -> f <$> df curs
 
-instance Alt Decoder where
-  fa <!> fb = Decoder $ \curs ->
+instance Alternative Decoder where
+  empty = Decoder $ \curs -> Failure curs NoDecoderMatched
+  fa <|> fb = Decoder $ \curs ->
     case runDecoder fa curs of
       s@(Success _) -> s
       Failure _ _ -> runDecoder fb curs
@@ -104,13 +98,6 @@ instance Monad Decoder where
       Success a -> runDecoder (f a) curs
       Failure curs' e -> Failure curs' e
 
-instance MonadError ConversionFailure Decoder where
-  throwError e = Decoder $ \curs -> Failure curs e
-  catchError ma handler = Decoder $ \curs ->
-    case runDecoder ma curs of
-      Success v -> Success v
-      Failure _ e -> runDecoder (handler e) curs
-
 instance Functor Result where
   fmap f (Success a) = Success (f a)
   fmap _ (Failure curs fa) = Failure curs fa
@@ -125,8 +112,11 @@ instance Monad Result where
   Success a  >>= f = f a
   Failure curs fa >>= _ = Failure curs fa
 
-throwCustomError :: (Typeable r, Show r) => r -> Decoder a
-throwCustomError = throwError . Other . Wrapped
+failWith :: ConversionFailure -> Decoder a
+failWith e = Decoder $ \curs -> Failure curs e
+
+failMessage :: T.Text -> Decoder a
+failMessage = failWith . Other
 
 jtype :: AT.Value -> JTy
 jtype = \case
@@ -170,7 +160,7 @@ nonempty :: Decoder a -> Decoder (NE.NonEmpty a)
 nonempty d = do
   ls <- list d
   case NE.nonEmpty ls of
-    Nothing -> throwCustomError $ Message "non-empty is empty"
+    Nothing -> failWith EmptyContainer
     Just v -> pure v
 
 -- | Determines if focused value is not null and if the value is an array or object
@@ -225,18 +215,17 @@ moveToKey field curs = do
 down :: JCurs -> Result JCurs
 down p = downTo . cursorFocus $ p
   where
-    failWith :: ConversionFailure -> Result a
-    failWith reason = Failure p reason
+    failWith' reason = Failure p reason
     downToObj obj = case HM.keys obj of
       (x:_) -> pure $ Object p x obj
-      [] -> failWith EmptyContainer      
+      [] -> failWith' EmptyContainer      
     downToArr arr = case V.null arr of
       False -> pure $ Array p 0 arr
-      True -> failWith EmptyContainer
+      True -> failWith' EmptyContainer
     downTo v = case v of
       AT.Object obj -> downToObj obj
       AT.Array arr -> downToArr arr
-      _            -> failWith $ TypeMismatch [JObject, JArray]
+      _            -> failWith' $ TypeMismatch [JObject, JArray]
 
 up :: JCurs -> Result JCurs
 up curs = case curs of
@@ -293,20 +282,20 @@ int = value >>= \case
   AT.Number s ->
     case S.floatingOrInteger s of
       Right i -> pure i
-      _       -> throwCustomError $ Message "numeric not integer"
-  _  -> throwError $ TypeMismatch [JNumber]
+      _       -> failMessage "numeric not integer"
+  _  -> failWith $ TypeMismatch [JNumber]
 
 -- | Extract string field from focus
 text :: Decoder T.Text
 text = value >>= \case
   AT.String s -> pure s
-  _           -> throwError $ TypeMismatch [JString]
+  _           -> failWith $ TypeMismatch [JString]
 
 -- | Extract bool field from focus
 bool :: Decoder Bool
 bool = value >>= \case
   AT.Bool b -> pure b
-  _         -> throwError $ TypeMismatch [JBool]
+  _         -> failWith $ TypeMismatch [JBool]
 
 -- | Construct a 'Decoder' from a 'AT.FromJSON' instance
 aeson :: AT.FromJSON a => Decoder a
@@ -314,7 +303,7 @@ aeson = do
   v <- value
   case AT.fromJSON v of
     AT.Success pv -> pure pv
-    AT.Error msg -> throwError $ AesonError (T.pack msg)
+    AT.Error msg -> failWith $ AesonError (T.pack msg)
 
 -- | Create a 'Decoder' from a 'APS.Parser' to parse a string field
 attoparsec :: APS.Parser a -> Decoder a
@@ -322,7 +311,7 @@ attoparsec parser = do
   t <- text
   case APS.parseOnly parser t of
     Right v -> pure v
-    Left msg -> throwError $ AttoparsecError (T.pack msg)
+    Left msg -> failWith $ AttoparsecError (T.pack msg)
 
 parseValue :: Decoder a -> AT.Value -> Result a
 parseValue decoder = runDecoder decoder . mkCursor
