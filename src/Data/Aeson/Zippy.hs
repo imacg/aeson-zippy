@@ -11,6 +11,8 @@ module Data.Aeson.Zippy
   , isNull
   , attoparsec
   , int
+  , float
+  , scientific
   , text
   , bool
   , aeson
@@ -277,13 +279,19 @@ atKey :: T.Text -> Decoder a -> Decoder a
 atKey field dec =
   withCursor $ down >=> moveToKey field >=> focus dec
 
+scientific :: Decoder S.Scientific
+scientific = value >>= \case
+  AT.Number s -> pure s
+  _           -> failWith $ TypeMismatch [JNumber]
+  
 int :: Integral i => Decoder i
-int = value >>= \case
-  AT.Number s ->
-    case S.floatingOrInteger s of
+int = scientific >>= \s ->
+  case S.floatingOrInteger s of
       Right i -> pure i
       _       -> failMessage "numeric not integer"
-  _  -> failWith $ TypeMismatch [JNumber]
+
+float :: RealFloat f => Decoder f
+float = S.toRealFloat <$> scientific
 
 -- | Extract string field from focus
 text :: Decoder T.Text
